@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"youtube-mini/internal/app"
@@ -25,6 +26,16 @@ func main() {
 
 	yt := youtube.New(apiKey)
 	legacy := transcode.New()
+
+	retroFilterEnv := strings.TrimSpace(os.Getenv("YTM_RETRO_FILTER"))
+	switch strings.ToLower(retroFilterEnv) {
+	case "", "off", "false", "0", "disable":
+		// noop
+	case "default":
+		legacy.WithRetroFilter(transcode.DefaultRetroFilter)
+	default:
+		legacy.WithRetroFilter(retroFilterEnv)
+	}
 
 	legacy.WithStreamResolver(transcode.StreamResolverFunc(func(ctx context.Context, videoID string) (string, error) {
 		video, err := yt.GetVideo(ctx, videoID)

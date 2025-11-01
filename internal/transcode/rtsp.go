@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
-	"net/http"
+	"net/url"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,14 +20,14 @@ import (
 	"github.com/bluenviron/gortsplib/v4/pkg/base"
 	"github.com/bluenviron/gortsplib/v4/pkg/description"
 	"github.com/bluenviron/gortsplib/v4/pkg/format"
+	"github.com/bluenviron/gortsplib/v4/pkg/headers"
 	"github.com/pion/rtp"
 )
 
 const (
-	defaultRTSPAddress      = ":8554"
-	rtspPublisherTimeout    = 12 * time.Second
-	rtspResolveTimeout      = 15 * time.Second
-	rtspIngestRetryInterval = 2 * time.Second
+	defaultRTSPAddress   = ":8554"
+	rtspPublisherTimeout = 12 * time.Second
+	rtspResolveTimeout   = 15 * time.Second
 )
 
 // StreamResolver resolves a YouTube video ID into a direct stream URL.
@@ -207,48 +209,50 @@ func profileSegment(profile Profile) string {
 	}
 }
 
-func (r *rtspServer) parsePath(path string) (Profile, string, error) {
+func (r *rtspServer) parsePath(path, query string) (Profile, string, float64, error) {
 	trimmed := strings.Trim(path, "/")
 	if trimmed == "" {
-		return "", "", errors.New("empty path")
+		return "", "", 0, errors.New("empty path")
 	}
 	parts := strings.Split(trimmed, "/")
 	if len(parts) < 2 {
-		return "", "", fmt.Errorf("invalid path %q", path)
+		return "", "", 0, fmt.Errorf("invalid path %q", path)
 	}
 	profilePart := strings.ToLower(parts[0])
 	videoPart := strings.Join(parts[1:], "/")
 	videoPart = strings.TrimSuffix(videoPart, ".3gp")
 	videoPart = strings.TrimSpace(videoPart)
 	if videoPart == "" {
-		return "", "", fmt.Errorf("invalid video id in %q", path)
+		return "", "", 0, fmt.Errorf("invalid video id in %q", path)
 	}
+
+	start := parseStartFromQuery(query)
 
 	switch profilePart {
 	case "", "retro":
-		return ProfileRetro, videoPart, nil
+		return ProfileRetro, videoPart, start, nil
 	case "edge":
-		return ProfileEdge, videoPart, nil
+		return ProfileEdge, videoPart, start, nil
 	default:
-		return "", "", fmt.Errorf("unsupported profile %q", profilePart)
+		return "", "", 0, fmt.Errorf("unsupported profile %q", profilePart)
 	}
 }
 
-func (r *rtspServer) getStream(path string) *rtspStream {
-	key := canonicalPath(path)
+func (r *rtspServer) getStream(path, query string) *rtspStream {
+	key := canonicalKey(path, query)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.streams[key]
 }
 
-func (r *rtspServer) getOrCreateStream(path string, profile Profile, videoID string) *rtspStream {
-	key := canonicalPath(path)
+func (r *rtspServer) getOrCreateStream(path, query string, profile Profile, videoID string, start float64) *rtspStream {
+	key := canonicalKey(path, query)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if existing, ok := r.streams[key]; ok {
 		return existing
 	}
-	stream := newRTSPStream(r, key, profile, videoID)
+	stream := newRTSPStream(r, key, canonicalPath(path), canonicalQuery(query), profile, videoID, start)
 	r.streams[key] = stream
 	return stream
 }
@@ -267,8 +271,8 @@ func (r *rtspServer) streamByPublisher(session *gortsplib.ServerSession) *rtspSt
 
 func (r *rtspServer) removeStream(stream *rtspStream) {
 	r.mu.Lock()
-	if current, ok := r.streams[stream.path]; ok && current == stream {
-		delete(r.streams, stream.path)
+	if current, ok := r.streams[stream.key]; ok && current == stream {
+		delete(r.streams, stream.key)
 	}
 	for sess, st := range r.publishers {
 		if st == stream {
@@ -282,12 +286,12 @@ func (r *rtspServer) removeStream(stream *rtspStream) {
 
 // OnDescribe handles DESCRIBE requests.
 func (r *rtspServer) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Response, *gortsplib.ServerStream, error) {
-	profile, videoID, err := r.parsePath(ctx.Path)
+	profile, videoID, start, err := r.parsePath(ctx.Path, ctx.Query)
 	if err != nil {
 		return &base.Response{StatusCode: base.StatusNotFound}, nil, nil
 	}
 
-	stream := r.getOrCreateStream(ctx.Path, profile, videoID)
+	stream := r.getOrCreateStream(ctx.Path, ctx.Query, profile, videoID, start)
 	stream.ensureStarted()
 
 	waitCtx, cancel := context.WithTimeout(context.Background(), rtspPublisherTimeout)
@@ -303,7 +307,7 @@ func (r *rtspServer) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*bas
 
 // OnAnnounce handles ANNOUNCE from the internal ffmpeg publisher.
 func (r *rtspServer) OnAnnounce(ctx *gortsplib.ServerHandlerOnAnnounceCtx) (*base.Response, error) {
-	stream := r.getStream(ctx.Path)
+	stream := r.getStream(ctx.Path, ctx.Query)
 	if stream == nil {
 		return &base.Response{StatusCode: base.StatusNotFound}, nil
 	}
@@ -326,7 +330,7 @@ func (r *rtspServer) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Resp
 		return &base.Response{StatusCode: base.StatusOK}, nil, nil
 	}
 
-	stream := r.getStream(ctx.Path)
+	stream := r.getStream(ctx.Path, ctx.Query)
 	if stream == nil {
 		return &base.Response{StatusCode: base.StatusNotFound}, nil, nil
 	}
@@ -339,13 +343,24 @@ func (r *rtspServer) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Resp
 }
 
 // OnPlay handles PLAY requests.
-func (r *rtspServer) OnPlay(_ *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
+func (r *rtspServer) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
+	stream := r.getStream(ctx.Path, ctx.Query)
+	if stream == nil {
+		return &base.Response{StatusCode: base.StatusNotFound}, nil
+	}
+
+	if offset, ok := rangeStartSeconds(ctx.Request); ok {
+		if err := stream.seek(offset); err != nil {
+			return &base.Response{StatusCode: base.StatusInvalidRange}, err
+		}
+	}
+
 	return &base.Response{StatusCode: base.StatusOK}, nil
 }
 
 // OnRecord handles RECORD requests from the publisher.
 func (r *rtspServer) OnRecord(ctx *gortsplib.ServerHandlerOnRecordCtx) (*base.Response, error) {
-	stream := r.getStream(ctx.Path)
+	stream := r.getStream(ctx.Path, ctx.Query)
 	if stream == nil {
 		return &base.Response{StatusCode: base.StatusNotFound}, nil
 	}
@@ -377,11 +392,13 @@ func isLocalPublisher(addr net.Addr) bool {
 }
 
 type rtspStream struct {
-	server    *rtspServer
-	path      string
-	profile   Profile
-	videoID   string
-	startOnce sync.Once
+	server      *rtspServer
+	key         string
+	path        string
+	query       string
+	profile     Profile
+	videoID     string
+	startOffset float64
 
 	mu        sync.RWMutex
 	stream    *gortsplib.ServerStream
@@ -389,25 +406,37 @@ type rtspStream struct {
 	cancel    context.CancelFunc
 	cmd       *exec.Cmd
 	err       error
-
+	cleanup   func()
+	running   bool
 	ready     chan struct{}
-	readyOnce sync.Once
 }
 
-func newRTSPStream(server *rtspServer, path string, profile Profile, videoID string) *rtspStream {
+func newRTSPStream(server *rtspServer, key, path, query string, profile Profile, videoID string, start float64) *rtspStream {
 	return &rtspStream{
-		server:  server,
-		path:    path,
-		profile: profile,
-		videoID: videoID,
-		ready:   make(chan struct{}),
+		server:      server,
+		key:         key,
+		path:        path,
+		query:       query,
+		profile:     profile,
+		videoID:     videoID,
+		startOffset: start,
+		ready:       make(chan struct{}),
 	}
 }
 
 func (rs *rtspStream) ensureStarted() {
-	rs.startOnce.Do(func() {
-		go rs.launchPublisher()
-	})
+	rs.mu.Lock()
+	if rs.running {
+		rs.mu.Unlock()
+		return
+	}
+	if rs.ready == nil {
+		rs.ready = make(chan struct{})
+	}
+	rs.running = true
+	rs.mu.Unlock()
+
+	go rs.launchPublisher()
 }
 
 func (rs *rtspStream) launchPublisher() {
@@ -420,34 +449,71 @@ func (rs *rtspStream) launchPublisher() {
 	streamURL, err := rs.server.svc.resolveStream(resolveCtx, rs.videoID)
 	resolveCancel()
 	if err != nil {
+		rs.setRunning(false)
 		rs.fail(fmt.Errorf("resolve stream: %w", err))
 		return
 	}
 
-	target := rs.publishURL()
-	args, err := profileRTSPArgs(rs.profile, target)
+	input, cleanup, err := rs.server.svc.buildInput(streamURL, rs.startOffset)
 	if err != nil {
+		rs.setRunning(false)
+		rs.fail(err)
+		return
+	}
+	rs.setCleanup(cleanup)
+
+	target := rs.publishURL()
+	args, err := rs.server.svc.profileRTSPArgs(rs.profile, input, target)
+	if err != nil {
+		if cb := rs.takeCleanup(); cb != nil {
+			cb()
+		}
+		rs.setRunning(false)
 		rs.fail(err)
 		return
 	}
 
 	cmd := exec.CommandContext(ctx, rs.server.svc.command, args...)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		rs.fail(fmt.Errorf("stdin pipe: %w", err))
-		return
+	var stdin io.WriteCloser
+	if input.pipe {
+		stdInPipe, err := cmd.StdinPipe()
+		if err != nil {
+			if cb := rs.takeCleanup(); cb != nil {
+				cb()
+			}
+			rs.setRunning(false)
+			rs.fail(fmt.Errorf("stdin pipe: %w", err))
+			return
+		}
+		stdin = stdInPipe
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		stdin.Close()
+		if stdin != nil {
+			_ = stdin.Close()
+		}
+		if cb := rs.takeCleanup(); cb != nil {
+			cb()
+		}
+		rs.setRunning(false)
 		rs.fail(fmt.Errorf("stderr pipe: %w", err))
 		return
 	}
 
 	if err := cmd.Start(); err != nil {
-		stdin.Close()
+		if stdin != nil {
+			_ = stdin.Close()
+		}
+		if cb := rs.takeCleanup(); cb != nil {
+			cb()
+		}
+		rs.setRunning(false)
 		rs.fail(fmt.Errorf("ffmpeg start: %w", err))
 		return
+	}
+
+	if input.pipe && stdin != nil {
+		rs.server.svc.startInputPump(ctx, stdin, input.srcURL)
 	}
 
 	rs.mu.Lock()
@@ -455,13 +521,21 @@ func (rs *rtspStream) launchPublisher() {
 	rs.mu.Unlock()
 
 	go rs.logStderr(stderr)
-	go rs.pipeStream(ctx, stdin, streamURL)
 
 	go func() {
 		err := cmd.Wait()
 		if err != nil && ctx.Err() == nil && !errors.Is(err, context.Canceled) {
 			log.Printf("[rtsp] ffmpeg wait: %v", err)
 		}
+		if cb := rs.takeCleanup(); cb != nil {
+			cb()
+		}
+		rs.mu.Lock()
+		if rs.cmd == cmd {
+			rs.cmd = nil
+		}
+		rs.running = false
+		rs.mu.Unlock()
 	}()
 }
 
@@ -472,6 +546,9 @@ func (rs *rtspStream) publishURL() string {
 		port = 8554
 	}
 	path := strings.TrimPrefix(rs.path, "/")
+	if rs.query != "" {
+		path = fmt.Sprintf("%s?%s", path, rs.query)
+	}
 	return fmt.Sprintf("rtsp://%s:%d/%s", host, port, path)
 }
 
@@ -485,55 +562,97 @@ func (rs *rtspStream) logStderr(r io.Reader) {
 	}
 }
 
-func (rs *rtspStream) pipeStream(ctx context.Context, stdin io.WriteCloser, srcURL string) {
-	defer stdin.Close()
-	for {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, srcURL, nil)
-		if err != nil {
-			rs.fail(fmt.Errorf("request build: %w", err))
-			return
-		}
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-		req.Header.Set("Referer", "https://www.youtube.com/")
-
-		resp, err := rs.server.svc.client.Do(req)
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			log.Printf("[rtsp fetch] %v", err)
-			time.Sleep(rtspIngestRetryInterval)
-			continue
-		}
-
-		_, err = io.Copy(stdin, resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			rs.fail(fmt.Errorf("feed ffmpeg: %w", err))
-		}
-		return
+func (rs *rtspStream) seek(offset float64) error {
+	if offset < 0 {
+		offset = 0
 	}
+
+	rs.mu.Lock()
+	current := rs.startOffset
+	oldReady := rs.ready
+	oldCancel := rs.cancel
+	oldCleanup := rs.cleanup
+	if math.Abs(current-offset) < 0.5 && rs.stream != nil {
+		rs.mu.Unlock()
+		return nil
+	}
+	rs.startOffset = offset
+	rs.cancel = nil
+	rs.cmd = nil
+	rs.err = nil
+	rs.cleanup = nil
+	rs.running = false
+	rs.ready = make(chan struct{})
+	rs.publisher = nil
+	rs.mu.Unlock()
+
+	if oldCancel != nil {
+		oldCancel()
+	}
+	if oldCleanup != nil {
+		oldCleanup()
+	}
+	safeClose(oldReady)
+
+	rs.ensureStarted()
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), rtspPublisherTimeout)
+	defer cancel()
+	_, err := rs.waitReady(waitCtx)
+	return err
+}
+
+func (rs *rtspStream) setRunning(state bool) {
+	rs.mu.Lock()
+	rs.running = state
+	rs.mu.Unlock()
+}
+
+func (rs *rtspStream) setCleanup(fn func()) {
+	rs.mu.Lock()
+	rs.cleanup = fn
+	rs.mu.Unlock()
+}
+
+func (rs *rtspStream) takeCleanup() func() {
+	rs.mu.Lock()
+	fn := rs.cleanup
+	rs.cleanup = nil
+	rs.mu.Unlock()
+	return fn
 }
 
 func (rs *rtspStream) waitReady(ctx context.Context) (*gortsplib.ServerStream, error) {
-	select {
-	case <-rs.ready:
+	for {
 		rs.mu.RLock()
-		defer rs.mu.RUnlock()
-		if rs.err != nil {
-			return nil, rs.err
+		ready := rs.ready
+		stream := rs.stream
+		publisher := rs.publisher
+		err := rs.err
+		rs.mu.RUnlock()
+
+		if err != nil {
+			return nil, err
 		}
-		if rs.stream == nil {
-			return nil, errors.New("rtsp: stream unavailable")
+		if publisher != nil && stream != nil {
+			return stream, nil
 		}
-		return rs.stream, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+		if ready == nil {
+			ready = make(chan struct{})
+			rs.mu.Lock()
+			if rs.ready == nil {
+				rs.ready = ready
+			} else {
+				ready = rs.ready
+			}
+			rs.mu.Unlock()
+		}
+
+		select {
+		case <-ready:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 }
 
@@ -544,24 +663,31 @@ func (rs *rtspStream) currentStream() *gortsplib.ServerStream {
 }
 
 func (rs *rtspStream) attachPublisher(session *gortsplib.ServerSession, desc *description.Session) error {
-	stream := &gortsplib.ServerStream{
-		Server: rs.server.server,
-		Desc:   desc,
-	}
-	if err := stream.Initialize(); err != nil {
-		rs.fail(fmt.Errorf("stream init: %w", err))
-		return err
-	}
-
 	rs.mu.Lock()
-	defer rs.mu.Unlock()
 	if rs.publisher != nil && rs.publisher != session {
-		stream.Close()
+		rs.mu.Unlock()
 		return errors.New("rtsp: publisher already connected")
 	}
+	stream := rs.stream
+	if stream == nil {
+		stream = &gortsplib.ServerStream{
+			Server: rs.server.server,
+			Desc:   desc,
+		}
+		if err := stream.Initialize(); err != nil {
+			rs.mu.Unlock()
+			rs.fail(fmt.Errorf("stream init: %w", err))
+			return err
+		}
+		rs.stream = stream
+	} else {
+		stream.Desc = desc
+	}
 	rs.publisher = session
-	rs.stream = stream
-	rs.readyOnce.Do(func() { close(rs.ready) })
+	ready := rs.ready
+	rs.mu.Unlock()
+
+	safeClose(ready)
 	return nil
 }
 
@@ -584,14 +710,21 @@ func (rs *rtspStream) fail(err error) {
 		rs.err = err
 	}
 	cancel := rs.cancel
+	cleanup := rs.cleanup
+	ready := rs.ready
 	rs.cancel = nil
+	rs.cleanup = nil
+	rs.running = false
 	rs.mu.Unlock()
 
 	if cancel != nil {
 		cancel()
 	}
+	if cleanup != nil {
+		cleanup()
+	}
 
-	rs.readyOnce.Do(func() { close(rs.ready) })
+	safeClose(ready)
 	log.Printf("[rtsp] %v", err)
 	rs.server.removeStream(rs)
 }
@@ -601,10 +734,14 @@ func (rs *rtspStream) shutdown() {
 	cancel := rs.cancel
 	cmd := rs.cmd
 	stream := rs.stream
+	cleanup := rs.cleanup
+	ready := rs.ready
 	rs.cancel = nil
 	rs.cmd = nil
 	rs.stream = nil
 	rs.publisher = nil
+	rs.cleanup = nil
+	rs.running = false
 	rs.mu.Unlock()
 
 	if cancel != nil {
@@ -616,6 +753,20 @@ func (rs *rtspStream) shutdown() {
 	if stream != nil {
 		stream.Close()
 	}
+	if cleanup != nil {
+		cleanup()
+	}
+	safeClose(ready)
+}
+
+func safeClose(ch chan struct{}) {
+	if ch == nil {
+		return
+	}
+	defer func() {
+		_ = recover()
+	}()
+	close(ch)
 }
 
 func canonicalPath(path string) string {
@@ -624,4 +775,78 @@ func canonicalPath(path string) string {
 		return "/"
 	}
 	return "/" + trimmed
+}
+
+func canonicalQuery(query string) string {
+	if query == "" {
+		return ""
+	}
+	values, err := url.ParseQuery(query)
+	if err != nil {
+		return query
+	}
+	keys := make([]string, 0, len(values))
+	for k := range values {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	canonical := url.Values{}
+	for _, k := range keys {
+		vals := values[k]
+		sort.Strings(vals)
+		for _, v := range vals {
+			canonical.Add(k, v)
+		}
+	}
+	return canonical.Encode()
+}
+
+func canonicalKey(path, query string) string {
+	base := canonicalPath(path)
+	if query == "" {
+		return base
+	}
+	cq := canonicalQuery(query)
+	if cq == "" {
+		return base
+	}
+	return base + "?" + cq
+}
+
+func parseStartFromQuery(rawQuery string) float64 {
+	if rawQuery == "" {
+		return 0
+	}
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return 0
+	}
+	spec := strings.TrimSpace(values.Get("start"))
+	if spec == "" {
+		spec = strings.TrimSpace(values.Get("t"))
+	}
+	if secs, ok := ParseTimeSpec(spec); ok {
+		return secs
+	}
+	return 0
+}
+
+func rangeStartSeconds(req *base.Request) (float64, bool) {
+	if req == nil {
+		return 0, false
+	}
+	raw, ok := req.Header["Range"]
+	if !ok || len(raw) == 0 {
+		return 0, false
+	}
+	var h headers.Range
+	if err := h.Unmarshal(raw); err != nil {
+		return 0, false
+	}
+	npt, ok := h.Value.(*headers.RangeNPT)
+	if !ok {
+		return 0, false
+	}
+	return npt.Start.Seconds(), true
 }

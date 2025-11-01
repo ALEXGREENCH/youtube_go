@@ -2,6 +2,7 @@ package watch
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -83,20 +84,48 @@ func Handler(client *youtube.Client, transcoder *transcode.Service) http.Handler
 			watchLaterURL = "/watchlater/add?id=" + url.QueryEscape(id) + "&return=" + url.QueryEscape(returnPath)
 		}
 
+		streamURL := fmt.Sprintf("/stream/%s.mp4", video.ID)
+		audioURL := fmt.Sprintf("/stream/audio/%s.mp3", video.ID)
+		startRaw := strings.TrimSpace(r.URL.Query().Get("start"))
+		if startRaw == "" {
+			startRaw = strings.TrimSpace(r.URL.Query().Get("t"))
+		}
+		startSuffix := ""
+		startSuffixFirst := ""
+		rtspStartSuffix := ""
+		if secs, ok := transcode.ParseTimeSpec(startRaw); ok && secs > 0 {
+			startInt := int(math.Round(secs))
+			if startInt > 0 {
+				startSuffix = fmt.Sprintf("&start=%d", startInt)
+				startSuffixFirst = fmt.Sprintf("?start=%d", startInt)
+				rtspStartSuffix = fmt.Sprintf("?start=%d", startInt)
+			}
+		}
+		if startSuffixFirst != "" {
+			streamURL += startSuffixFirst
+			audioURL += startSuffixFirst
+		}
+
 		transcodeLinks := []ui.Link{
-			{Label: "MP4 240p (AAC)", URL: fmt.Sprintf("/stream/ffmpeg/%s.mp4?aac", video.ID)},
+			{Label: "MP4 240p (AAC)", URL: fmt.Sprintf("/stream/ffmpeg/%s.mp4?aac%s", video.ID, startSuffix)},
 		}
 		if transcoder != nil && transcoder.RTSPEnabled() {
 			if retro := transcoder.RTSPURL(r.Host, transcode.ProfileRetro, video.ID); retro != "" {
+				if rtspStartSuffix != "" {
+					retro += rtspStartSuffix
+				}
 				transcodeLinks = append(transcodeLinks, ui.Link{Label: "3GP 144p (Retro RTSP)", URL: retro})
 			}
 			if edge := transcoder.RTSPURL(r.Host, transcode.ProfileEdge, video.ID); edge != "" {
+				if rtspStartSuffix != "" {
+					edge += rtspStartSuffix
+				}
 				transcodeLinks = append(transcodeLinks, ui.Link{Label: "3GP 96p (Edge RTSP)", URL: edge})
 			}
 		} else {
 			transcodeLinks = append(transcodeLinks,
-				ui.Link{Label: "3GP 144p (Retro)", URL: fmt.Sprintf("/stream/ffmpeg/%s.mp4?retro", video.ID)},
-				ui.Link{Label: "3GP 96p (Edge)", URL: fmt.Sprintf("/stream/ffmpeg/%s.mp4?edge", video.ID)},
+				ui.Link{Label: "3GP 144p (Retro)", URL: fmt.Sprintf("/stream/ffmpeg/%s.mp4?retro%s", video.ID, startSuffix)},
+				ui.Link{Label: "3GP 96p (Edge)", URL: fmt.Sprintf("/stream/ffmpeg/%s.mp4?edge%s", video.ID, startSuffix)},
 			)
 		}
 
@@ -104,8 +133,8 @@ func Handler(client *youtube.Client, transcoder *transcode.Service) http.Handler
 			Theme:             theme.FromRequest(r),
 			CurrentPath:       returnPath,
 			Video:             video,
-			StreamURL:         fmt.Sprintf("/stream/%s.mp4", video.ID),
-			AudioURL:          fmt.Sprintf("/stream/audio/%s.mp3", video.ID),
+			StreamURL:         streamURL,
+			AudioURL:          audioURL,
 			TranscodeLinks:    transcodeLinks,
 			Captions:          video.Captions,
 			AutoplayEnabled:   autoplayEnabled,
