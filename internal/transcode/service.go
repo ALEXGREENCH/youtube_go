@@ -25,15 +25,19 @@ const (
 
 // Service converts modern streams to legacy-friendly formats on the fly.
 type Service struct {
-	command string
-	client  *http.Client
+	command  string
+	client   *http.Client
+	resolver StreamResolver
+	rtsp     *rtspServer
+	rtspAddr string
 }
 
 // New returns a Service with defaults.
 func New() *Service {
 	return &Service{
-		command: "ffmpeg",
-		client:  http.DefaultClient,
+		command:  "ffmpeg",
+		client:   http.DefaultClient,
+		rtspAddr: defaultRTSPAddress,
 	}
 }
 
@@ -165,6 +169,39 @@ func profileArgs(profile Profile) (args []string, format outputFormat, err error
 	default:
 		return nil, outputFormat{}, fmt.Errorf("unknown profile %q", profile)
 	}
+}
+
+func profileRTSPArgs(profile Profile, target string) ([]string, error) {
+	base := []string{
+		"-hide_banner", "-re",
+		"-i", "pipe:0",
+	}
+
+	switch profile {
+	case ProfileRetro, "":
+		base = append(base,
+			"-vf", "scale=176:144,fps=12",
+			"-c:v", "h263", "-b:v", "120k",
+			"-c:a", "libopencore_amrnb", "-ar", "8000", "-ac", "1", "-b:a", "12.2k",
+		)
+	case ProfileEdge:
+		base = append(base,
+			"-vf", "scale=128:96,fps=10",
+			"-c:v", "h263", "-b:v", "60k",
+			"-c:a", "libopencore_amrnb", "-ar", "8000", "-ac", "1", "-b:a", "10.2k",
+		)
+	default:
+		return nil, fmt.Errorf("profile %s does not support RTSP output", profile)
+	}
+
+	base = append(base,
+		"-f", "rtsp",
+		"-rtsp_transport", "tcp",
+		"-muxdelay", "0.1",
+		target,
+	)
+
+	return base, nil
 }
 
 type outputFormat struct {

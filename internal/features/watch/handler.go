@@ -12,12 +12,13 @@ import (
 	"youtube-mini/internal/features/subscriptions"
 	"youtube-mini/internal/features/theme"
 	"youtube-mini/internal/features/watchlater"
+	"youtube-mini/internal/transcode"
 	"youtube-mini/internal/ui"
 	"youtube-mini/internal/youtube"
 )
 
 // Handler renders the watch page with related videos, queue controls, watch later, and autoplay.
-func Handler(client *youtube.Client) http.HandlerFunc {
+func Handler(client *youtube.Client, transcoder *transcode.Service) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimSpace(r.URL.Query().Get("v"))
 		if id == "" {
@@ -82,17 +83,30 @@ func Handler(client *youtube.Client) http.HandlerFunc {
 			watchLaterURL = "/watchlater/add?id=" + url.QueryEscape(id) + "&return=" + url.QueryEscape(returnPath)
 		}
 
+		transcodeLinks := []ui.Link{
+			{Label: "MP4 240p (AAC)", URL: fmt.Sprintf("/stream/ffmpeg/%s.mp4?aac", video.ID)},
+		}
+		if transcoder != nil && transcoder.RTSPEnabled() {
+			if retro := transcoder.RTSPURL(r.Host, transcode.ProfileRetro, video.ID); retro != "" {
+				transcodeLinks = append(transcodeLinks, ui.Link{Label: "3GP 144p (Retro RTSP)", URL: retro})
+			}
+			if edge := transcoder.RTSPURL(r.Host, transcode.ProfileEdge, video.ID); edge != "" {
+				transcodeLinks = append(transcodeLinks, ui.Link{Label: "3GP 96p (Edge RTSP)", URL: edge})
+			}
+		} else {
+			transcodeLinks = append(transcodeLinks,
+				ui.Link{Label: "3GP 144p (Retro)", URL: fmt.Sprintf("/stream/ffmpeg/%s.mp4?retro", video.ID)},
+				ui.Link{Label: "3GP 96p (Edge)", URL: fmt.Sprintf("/stream/ffmpeg/%s.mp4?edge", video.ID)},
+			)
+		}
+
 		data := ui.WatchPageData{
-			Theme:       theme.FromRequest(r),
-			CurrentPath: returnPath,
-			Video:       video,
-			StreamURL:   fmt.Sprintf("/stream/%s.mp4", video.ID),
-			AudioURL:    fmt.Sprintf("/stream/audio/%s.mp3", video.ID),
-			TranscodeLinks: []ui.Link{
-				{Label: "MP4 240p (AAC)", URL: fmt.Sprintf("/stream/ffmpeg/%s.mp4?aac", video.ID)},
-				{Label: "3GP 144p (Retro)", URL: fmt.Sprintf("/stream/ffmpeg/%s.mp4?retro", video.ID)},
-				{Label: "3GP 96p (Edge)", URL: fmt.Sprintf("/stream/ffmpeg/%s.mp4?edge", video.ID)},
-			},
+			Theme:             theme.FromRequest(r),
+			CurrentPath:       returnPath,
+			Video:             video,
+			StreamURL:         fmt.Sprintf("/stream/%s.mp4", video.ID),
+			AudioURL:          fmt.Sprintf("/stream/audio/%s.mp3", video.ID),
+			TranscodeLinks:    transcodeLinks,
 			Captions:          video.Captions,
 			AutoplayEnabled:   autoplayEnabled,
 			AutoplayToggleURL: "/settings/autoplay?return=" + url.QueryEscape(returnPath),
