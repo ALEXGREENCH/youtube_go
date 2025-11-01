@@ -29,7 +29,8 @@ func Handler(client *youtube.Client, svc *transcode.Service) http.HandlerFunc {
 		}
 
 		profile := profileFromQuery(r)
-		if err := svc.Stream(r.Context(), w, video.Stream, id, profile); err != nil {
+		start := startFromQuery(r)
+		if err := svc.Stream(r.Context(), w, video.Stream, id, profile, start); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -48,4 +49,19 @@ func profileFromQuery(r *http.Request) transcode.Profile {
 	default:
 		return transcode.ProfileRetro
 	}
+}
+
+func startFromQuery(r *http.Request) float64 {
+	q := r.URL.Query()
+	raw := strings.TrimSpace(q.Get("start"))
+	if raw == "" {
+		raw = strings.TrimSpace(q.Get("t"))
+	}
+	if raw == "" {
+		return 0
+	}
+	if secs, ok := transcode.ParseTimeSpec(raw); ok {
+		return secs
+	}
+	return 0
 }

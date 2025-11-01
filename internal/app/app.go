@@ -64,7 +64,7 @@ func New(youtubeClient *youtube.Client, legacy *transcode.Service) *App {
 	mux.Handle("/", registry.Wrap("home", index.Handler(youtubeClient)))
 	mux.Handle("/explore", registry.Wrap("explore", explore.Handler(youtubeClient)))
 	mux.Handle("/search", registry.Wrap("search", search.Handler(youtubeClient)))
-	mux.Handle("/watch", registry.Wrap("watch", watch.Handler(youtubeClient)))
+	mux.Handle("/watch", registry.Wrap("watch", watch.Handler(youtubeClient, legacy)))
 	mux.Handle("/channel", registry.Wrap("channel", channel.Handler(youtubeClient)))
 	mux.Handle("/playlist", registry.Wrap("playlist", playlist.Handler()))
 	mux.Handle("/subscriptions", registry.Wrap("subscriptions", subscriptions.Handler(youtubeClient, watchlater.ReadSet)))
