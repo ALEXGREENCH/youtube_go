@@ -18,6 +18,8 @@ type Format struct {
 	URL     string
 	Quality string
 	Bitrate string
+	// ContentLength conveys the total byte size returned by the API (string to avoid int parsing issues in templates).
+	ContentLength string
 }
 
 // CaptionTrack describes an available subtitle track.
@@ -40,6 +42,8 @@ type Video struct {
 	Captions      []CaptionTrack
 	Stream        string
 	ThumbURL      string
+	// HLSManifest exposes the adaptive playlist for clients with HLS support.
+	HLSManifest string
 }
 
 // FeedItem represents a lightweight video card for feeds like home or trending.

@@ -114,10 +114,12 @@ func newRTSPServer(svc *Service, addr string) (*rtspServer, error) {
 	}
 
 	rtspSrv := &gortsplib.Server{
-		Handler:      rs,
-		RTSPAddress:  addr,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		Handler:        rs,
+		RTSPAddress:    addr,
+		UDPRTPAddress:  svc.udpRTPAddr,
+		UDPRTCPAddress: svc.udpRTCPAddr,
+		ReadTimeout:    10 * time.Second,
+		WriteTimeout:   10 * time.Second,
 	}
 
 	if err := rtspSrv.Start(); err != nil {
@@ -202,6 +204,8 @@ func profileSegment(profile Profile) string {
 	switch profile {
 	case ProfileEdge:
 		return "edge"
+	case ProfileAndroid:
+		return "android"
 	case ProfileRetro, "":
 		return "retro"
 	default:
@@ -209,32 +213,35 @@ func profileSegment(profile Profile) string {
 	}
 }
 
-func (r *rtspServer) parsePath(path, query string) (Profile, string, float64, error) {
+func (r *rtspServer) parsePath(path, query string) (Profile, string, float64, string, error) {
 	trimmed := strings.Trim(path, "/")
 	if trimmed == "" {
-		return "", "", 0, errors.New("empty path")
+		return "", "", 0, "", errors.New("empty path")
 	}
 	parts := strings.Split(trimmed, "/")
 	if len(parts) < 2 {
-		return "", "", 0, fmt.Errorf("invalid path %q", path)
+		return "", "", 0, "", fmt.Errorf("invalid path %q", path)
 	}
 	profilePart := strings.ToLower(parts[0])
 	videoPart := strings.Join(parts[1:], "/")
 	videoPart = strings.TrimSuffix(videoPart, ".3gp")
 	videoPart = strings.TrimSpace(videoPart)
 	if videoPart == "" {
-		return "", "", 0, fmt.Errorf("invalid video id in %q", path)
+		return "", "", 0, "", fmt.Errorf("invalid video id in %q", path)
 	}
 
 	start := parseStartFromQuery(query)
+	transport := transportFromQuery(query, r.svc.rtspTransport)
 
 	switch profilePart {
 	case "", "retro":
-		return ProfileRetro, videoPart, start, nil
+		return ProfileRetro, videoPart, start, transport, nil
 	case "edge":
-		return ProfileEdge, videoPart, start, nil
+		return ProfileEdge, videoPart, start, transport, nil
+	case "android":
+		return ProfileAndroid, videoPart, start, transport, nil
 	default:
-		return "", "", 0, fmt.Errorf("unsupported profile %q", profilePart)
+		return "", "", 0, "", fmt.Errorf("unsupported profile %q", profilePart)
 	}
 }
 
@@ -245,14 +252,14 @@ func (r *rtspServer) getStream(path, query string) *rtspStream {
 	return r.streams[key]
 }
 
-func (r *rtspServer) getOrCreateStream(path, query string, profile Profile, videoID string, start float64) *rtspStream {
+func (r *rtspServer) getOrCreateStream(path, query string, profile Profile, videoID string, start float64, transport string) *rtspStream {
 	key := canonicalKey(path, query)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if existing, ok := r.streams[key]; ok {
 		return existing
 	}
-	stream := newRTSPStream(r, key, canonicalPath(path), canonicalQuery(query), profile, videoID, start)
+	stream := newRTSPStream(r, key, canonicalPath(path), canonicalQuery(query), profile, videoID, start, transport)
 	r.streams[key] = stream
 	return stream
 }
@@ -286,12 +293,12 @@ func (r *rtspServer) removeStream(stream *rtspStream) {
 
 // OnDescribe handles DESCRIBE requests.
 func (r *rtspServer) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Response, *gortsplib.ServerStream, error) {
-	profile, videoID, start, err := r.parsePath(ctx.Path, ctx.Query)
+	profile, videoID, start, transport, err := r.parsePath(ctx.Path, ctx.Query)
 	if err != nil {
 		return &base.Response{StatusCode: base.StatusNotFound}, nil, nil
 	}
 
-	stream := r.getOrCreateStream(ctx.Path, ctx.Query, profile, videoID, start)
+	stream := r.getOrCreateStream(ctx.Path, ctx.Query, profile, videoID, start, transport)
 	stream.ensureStarted()
 
 	waitCtx, cancel := context.WithTimeout(context.Background(), rtspPublisherTimeout)
@@ -399,6 +406,7 @@ type rtspStream struct {
 	profile     Profile
 	videoID     string
 	startOffset float64
+	transport   string
 
 	mu        sync.RWMutex
 	stream    *gortsplib.ServerStream
@@ -411,7 +419,7 @@ type rtspStream struct {
 	ready     chan struct{}
 }
 
-func newRTSPStream(server *rtspServer, key, path, query string, profile Profile, videoID string, start float64) *rtspStream {
+func newRTSPStream(server *rtspServer, key, path, query string, profile Profile, videoID string, start float64, transport string) *rtspStream {
 	return &rtspStream{
 		server:      server,
 		key:         key,
@@ -420,6 +428,7 @@ func newRTSPStream(server *rtspServer, key, path, query string, profile Profile,
 		profile:     profile,
 		videoID:     videoID,
 		startOffset: start,
+		transport:   transport,
 		ready:       make(chan struct{}),
 	}
 }
@@ -463,7 +472,8 @@ func (rs *rtspStream) launchPublisher() {
 	rs.setCleanup(cleanup)
 
 	target := rs.publishURL()
-	args, err := rs.server.svc.profileRTSPArgs(rs.profile, input, target)
+	transport := rs.transport
+	args, err := rs.server.svc.profileRTSPArgs(rs.profile, input, target, transport)
 	if err != nil {
 		if cb := rs.takeCleanup(); cb != nil {
 			cb()
@@ -830,6 +840,29 @@ func parseStartFromQuery(rawQuery string) float64 {
 		return secs
 	}
 	return 0
+}
+
+func transportFromQuery(rawQuery, fallback string) string {
+	if rawQuery == "" {
+		return fallback
+	}
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return fallback
+	}
+	for _, key := range []string{"transport", "rtsp_transport"} {
+		if v := strings.ToLower(strings.TrimSpace(values.Get(key))); v != "" {
+			switch v {
+			case "tcp", "udp", "udp_multicast":
+				return v
+			case "auto":
+				return ""
+			default:
+				log.Printf("[rtsp] unsupported transport query %q, using fallback", v)
+			}
+		}
+	}
+	return fallback
 }
 
 func rangeStartSeconds(req *base.Request) (float64, bool) {

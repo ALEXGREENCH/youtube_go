@@ -37,6 +37,15 @@ func main() {
 		legacy.WithRetroFilter(retroFilterEnv)
 	}
 
+	if transport := strings.TrimSpace(os.Getenv("YTM_RTSP_TRANSPORT")); transport != "" {
+		legacy.WithRTSPTransport(transport)
+	}
+	rtpEnv := strings.TrimSpace(os.Getenv("YTM_RTSP_UDP_RTP"))
+	rtcpEnv := strings.TrimSpace(os.Getenv("YTM_RTSP_UDP_RTCP"))
+	if rtpEnv != "" || rtcpEnv != "" {
+		legacy.WithRTSPUDPPorts(rtpEnv, rtcpEnv)
+	}
+
 	legacy.WithStreamResolver(transcode.StreamResolverFunc(func(ctx context.Context, videoID string) (string, error) {
 		video, err := yt.GetVideo(ctx, videoID)
 		if err != nil {

@@ -17,6 +17,10 @@ import (
 const (
 	defaultSearchAgent = "Mozilla/5.0 (Mobile; rv:48.0) Gecko/48.0 Firefox/48.0 KAIOS/2.5.4"
 	videoCacheTTL      = time.Hour
+	androidClientName  = "ANDROID"
+	androidClientVersion = "19.43.36"
+	androidUserAgent   = "com.google.android.youtube/19.43.36 (Linux; Android 11) gzip"
+	androidSdkVersion  = 30
 )
 
 // Client wraps the handful of YouTube API calls we rely on.
@@ -111,8 +115,12 @@ func (c *Client) GetVideo(ctx context.Context, id string) (Video, error) {
 			"client": map[string]any{
 				"hl":            "en",
 				"gl":            "US",
-				"clientName":    "ANDROID",
-				"clientVersion": "19.09.37",
+				"clientName":    androidClientName,
+				"clientVersion": androidClientVersion,
+				"androidSdkVersion": androidSdkVersion,
+				"userAgent":     androidUserAgent,
+				"osName":        "Android",
+				"osVersion":     "11",
 			},
 		},
 	}
@@ -128,7 +136,9 @@ func (c *Client) GetVideo(ctx context.Context, id string) (Video, error) {
 		return Video{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "com.google.android.youtube/19.09.37 (Linux; Android 2.3.7)")
+	req.Header.Set("User-Agent", androidUserAgent)
+	req.Header.Set("X-YouTube-Client-Name", "3")
+	req.Header.Set("X-YouTube-Client-Version", androidClientVersion)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -171,6 +181,7 @@ func (c *Client) GetVideo(ctx context.Context, id string) (Video, error) {
 	if len(videoFormats) > 0 {
 		stream = videoFormats[0].URL
 	}
+	hlsManifest := fmt.Sprint(decoded.StreamingData["hlsManifestUrl"])
 
 	video := Video{
 		ID:            id,
@@ -184,6 +195,7 @@ func (c *Client) GetVideo(ctx context.Context, id string) (Video, error) {
 		Captions:      captions,
 		Stream:        stream,
 		ThumbURL:      fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", id),
+		HLSManifest:   hlsManifest,
 	}
 	c.videoCache.Set(id, video, videoCacheTTL)
 	return video, nil
@@ -267,11 +279,12 @@ func buildFormat(raw any) Format {
 		return Format{}
 	}
 	return Format{
-		Itag:    fmt.Sprint(data["itag"]),
-		Mime:    fmt.Sprint(data["mimeType"]),
-		URL:     fmt.Sprint(data["url"]),
-		Quality: fmt.Sprint(data["qualityLabel"]),
-		Bitrate: fmt.Sprint(data["bitrate"]),
+		Itag:          fmt.Sprint(data["itag"]),
+		Mime:          fmt.Sprint(data["mimeType"]),
+		URL:           fmt.Sprint(data["url"]),
+		Quality:       fmt.Sprint(data["qualityLabel"]),
+		Bitrate:       fmt.Sprint(data["bitrate"]),
+		ContentLength: fmt.Sprint(data["contentLength"]),
 	}
 }
 

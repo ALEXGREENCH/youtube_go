@@ -122,6 +122,12 @@ func Handler(client *youtube.Client, transcoder *transcode.Service) http.Handler
 				}
 				transcodeLinks = append(transcodeLinks, ui.Link{Label: "3GP 96p (Edge RTSP)", URL: edge})
 			}
+			if android := transcoder.RTSPURL(r.Host, transcode.ProfileAndroid, video.ID); android != "" {
+				if rtspStartSuffix != "" {
+					android += rtspStartSuffix
+				}
+				transcodeLinks = append(transcodeLinks, ui.Link{Label: "RTSP 240p (Android MPEG-4)", URL: android})
+			}
 		} else {
 			transcodeLinks = append(transcodeLinks,
 				ui.Link{Label: "3GP 144p (Retro)", URL: fmt.Sprintf("/stream/ffmpeg/%s.mp4?retro%s", video.ID, startSuffix)},
