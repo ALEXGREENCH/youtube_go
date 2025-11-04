@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"youtube-mini/internal/ui"
@@ -17,10 +19,11 @@ import (
 type Profile string
 
 const (
-	ProfileRetro Profile = "retro"
-	ProfileAAC   Profile = "aac"
-	ProfileMP3   Profile = "mp3"
-	ProfileEdge  Profile = "edge"
+	ProfileRetro   Profile = "retro"
+	ProfileAAC     Profile = "aac"
+	ProfileMP3     Profile = "mp3"
+	ProfileEdge    Profile = "edge"
+	ProfileAndroid Profile = "android"
 )
 
 const (
@@ -38,12 +41,15 @@ type ffmpegInput struct {
 
 // Service converts modern streams to legacy-friendly formats on the fly.
 type Service struct {
-	command     string
-	client      *http.Client
-	resolver    StreamResolver
-	rtsp        *rtspServer
-	rtspAddr    string
-	retroFilter string
+	command       string
+	client        *http.Client
+	resolver      StreamResolver
+	rtsp          *rtspServer
+	rtspAddr      string
+	retroFilter   string
+	rtspTransport string
+	udpRTPAddr    string
+	udpRTCPAddr   string
 }
 
 const DefaultRetroFilter = "eq=contrast=1.08:saturation=1.08,unsharp=4:4:0.45"
@@ -51,9 +57,12 @@ const DefaultRetroFilter = "eq=contrast=1.08:saturation=1.08,unsharp=4:4:0.45"
 // New returns a Service with defaults.
 func New() *Service {
 	return &Service{
-		command:  "ffmpeg",
-		client:   http.DefaultClient,
-		rtspAddr: defaultRTSPAddress,
+		command:       "ffmpeg",
+		client:        http.DefaultClient,
+		rtspAddr:      defaultRTSPAddress,
+		rtspTransport: "udp",
+		udpRTPAddr:    "0.0.0.0:6970",
+		udpRTCPAddr:   "0.0.0.0:6971",
 	}
 }
 
@@ -75,6 +84,74 @@ func (s *Service) WithHTTPClient(client *http.Client) *Service {
 func (s *Service) WithRetroFilter(filter string) *Service {
 	s.retroFilter = strings.TrimSpace(filter)
 	return s
+}
+
+// WithRTSPTransport overrides the ffmpeg RTSP transport (tcp or udp).
+func (s *Service) WithRTSPTransport(transport string) *Service {
+	transport = strings.ToLower(strings.TrimSpace(transport))
+	switch transport {
+	case "", "tcp":
+		s.rtspTransport = "tcp"
+	case "udp", "udp_multicast":
+		s.rtspTransport = transport
+	default:
+		log.Printf("[rtsp] unsupported transport %q, keeping %s", transport, s.rtspTransport)
+	}
+	return s
+}
+
+// WithRTSPUDPPorts overrides the UDP RTP/RTCP bind addresses.
+func (s *Service) WithRTSPUDPPorts(rtpAddr, rtcpAddr string) *Service {
+	rtpAddr = strings.TrimSpace(rtpAddr)
+	rtcpAddr = strings.TrimSpace(rtcpAddr)
+	if rtpAddr == "" && rtcpAddr == "" {
+		return s
+	}
+	if rtpAddr == "" || rtcpAddr == "" {
+		log.Printf("[rtsp] both RTP and RTCP addresses must be provided (got %q, %q)", rtpAddr, rtcpAddr)
+		return s
+	}
+	rtpPort, err := portNumber(rtpAddr)
+	if err != nil {
+		log.Printf("[rtsp] invalid RTP address %q: %v", rtpAddr, err)
+		return s
+	}
+	rtcpPort, err := portNumber(rtcpAddr)
+	if err != nil {
+		log.Printf("[rtsp] invalid RTCP address %q: %v", rtcpAddr, err)
+		return s
+	}
+	if rtcpPort-rtpPort != 1 {
+		log.Printf("[rtsp] RTP (%d) and RTCP (%d) ports must be consecutive; keeping defaults", rtpPort, rtcpPort)
+		return s
+	}
+	s.udpRTPAddr = rtpAddr
+	s.udpRTCPAddr = rtcpAddr
+	return s
+}
+
+func portNumber(addr string) (int, error) {
+	if addr == "" {
+		return 0, fmt.Errorf("empty address")
+	}
+	if strings.Count(addr, ":") == 0 {
+		return strconv.Atoi(addr)
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		if strings.HasPrefix(addr, ":") {
+			return strconv.Atoi(strings.TrimPrefix(addr, ":"))
+		}
+		return 0, err
+	}
+	if port == "" {
+		return 0, fmt.Errorf("missing port in %q", addr)
+	}
+	if host == "" {
+		// allow ":6970" form
+		return strconv.Atoi(port)
+	}
+	return strconv.Atoi(port)
 }
 
 func (s *Service) buildInput(srcURL string, start float64) (ffmpegInput, func(), error) {
@@ -233,10 +310,24 @@ func (s *Service) profileArgs(profile Profile, input ffmpegInput) (args []string
 	}
 }
 
-func (s *Service) profileRTSPArgs(profile Profile, input ffmpegInput, target string) ([]string, error) {
+func (s *Service) profileRTSPArgs(profile Profile, input ffmpegInput, target string, transport string) ([]string, error) {
 	base := append([]string{}, input.args...)
 	if input.pipe && input.postSeek {
 		base = append(base, "-ss", formatSeek(input.start))
+	}
+
+	if transport == "" {
+		transport = s.rtspTransport
+	}
+	transport = strings.ToLower(strings.TrimSpace(transport))
+	switch transport {
+	case "udp", "tcp", "udp_multicast":
+		// ok
+	case "":
+		transport = s.rtspTransport
+	default:
+		log.Printf("[rtsp] unsupported transport %q, defaulting to %s", transport, s.rtspTransport)
+		transport = s.rtspTransport
 	}
 
 	switch profile {
@@ -245,7 +336,7 @@ func (s *Service) profileRTSPArgs(profile Profile, input ffmpegInput, target str
 		base = append(base,
 			"-vf", vf,
 			"-c:v", "h263", "-b:v", "120k",
-			"-c:a", "aac", "-ar", "32000", "-ac", "1", "-b:a", "32k",
+			"-c:a", "libopencore_amrnb", "-ar", "8000", "-ac", "1", "-b:a", "12.2k",
 		)
 	case ProfileEdge:
 		vf := buildFilterChain([]string{"scale=128:96", "fps=10"}, s.retroFilter)
@@ -254,13 +345,29 @@ func (s *Service) profileRTSPArgs(profile Profile, input ffmpegInput, target str
 			"-c:v", "h263", "-b:v", "60k",
 			"-c:a", "libopencore_amrnb", "-ar", "8000", "-ac", "1", "-b:a", "10.2k",
 		)
+	case ProfileAndroid:
+		vf := buildFilterChain([]string{"scale=320:180", "fps=24"}, s.retroFilter)
+		base = append(base,
+			"-vf", vf,
+			"-c:v", "mpeg4",
+			"-pix_fmt", "yuv420p",
+			"-b:v", "350k",
+			"-maxrate", "400k",
+			"-bufsize", "800k",
+			"-bf", "0",
+			"-g", "48",
+			"-keyint_min", "24",
+			"-c:a", "aac",
+			"-ar", "44100",
+			"-ac", "2",
+			"-b:a", "64k",
+		)
 	default:
 		return nil, fmt.Errorf("profile %s does not support RTSP output", profile)
 	}
-
 	base = append(base,
 		"-f", "rtsp",
-		"-rtsp_transport", "tcp",
+		"-rtsp_transport", transport,
 		"-muxdelay", "0.1",
 		target,
 	)
