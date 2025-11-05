@@ -20,6 +20,8 @@ const (
 )
 
 func main() {
+	startAdmin()
+
 	addr := getenv("YOUTUBE_MINI_ADDR", defaultAddr)
 	apiKey := getenv("YOUTUBE_API_KEY", defaultAPIKey)
 	rtspAddr := getenv("YTM_RTSP_ADDR", "")
